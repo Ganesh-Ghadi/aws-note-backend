@@ -1,0 +1,157 @@
+# The name of the workflow in the GitHub Actions UI.
+name: Deploy Backend to EC2
+
+# 'on' defines what triggers this workflow.
+on:
+  # Runs automatically on every push to the 'main' branch.
+  push:
+    branches: [main] 
+  # Allows you to manually click a "Run workflow" button in GitHub Actions tab.
+  workflow_dispatch: 
+
+jobs:
+  build-and-deploy:
+    # Uses a temporary Ubuntu server provided by GitHub.
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Step 1: Download your repository's code.
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      # Step 2: Install Node.js so we can run npm commands.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      # Step 3: Install dependencies and package the code.
+      - name: Install & Package
+        run: |
+          # 'npm ci' strictly installs what is in package-lock.json for reliable builds.
+          npm ci
+          
+          # Create a temporary 'deploy' folder to gather only the files we need on the server.
+          # We don't want to send the massive 'node_modules' folder.
+          mkdir -p deploy
+          
+          # Copy the source code, package definitions, and configuration files to our deploy folder.
+          cp -r src deploy/
+          cp package*.json deploy/
+          
+          # These check if ecosystem config (for PM2) or Prisma schema exist. If they do, copy them. 
+          # '|| true' ensures the workflow doesn't fail if the files are missing.
+          [ -f ecosystem.config.cjs ] && cp ecosystem.config.cjs deploy/ || true
+          [ -d prisma ] && cp -r prisma deploy/ || true
+          [ -f prisma.config.js ] && cp prisma.config.js deploy/ || true
+          
+          # Compress the entire 'deploy' folder into a single file ('backend-deploy.tar.gz').
+          tar -czf backend-deploy.tar.gz -C deploy .
+
+      # Step 4: Transfer the package to EC2 and execute server commands.
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          # Create the SSH key file locally on the GitHub runner and secure it.
+          echo "$SSH_PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
+
+          # Use 'scp' to securely copy our compressed code to the '/tmp' directory on your EC2 server.
+          scp -i private_key.pem -o StrictHostKeyChecking=no \
+            backend-deploy.tar.gz ${EC2_USERNAME}@${EC2_HOST}:/tmp/
+
+          # Use 'ssh' to run all the commands between '<< EOF' directly ON YOUR EC2 SERVER.
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USERNAME}@${EC2_HOST} << 'EOF'
+            
+            echo "--- Deploying Backend ---"
+            
+            # Ensure the directory exists and we have permission to edit it.
+            sudo mkdir -p /var/www/notes-app/backend
+            sudo chown -R $USER:$USER /var/www/notes-app/backend
+            cd /var/www/notes-app/backend
+            
+            # BACKUP SYSTEM: If an old version exists ('src' folder), zip it up as a backup.
+            if [ -d "src" ]; then
+              timestamp=$(date +%Y%m%d_%H%M%S)
+              mkdir -p backups
+              
+              # Attempt to zip existing critical files into the backups folder.
+              tar -czf backups/backup_${timestamp}.tar.gz src package.json ecosystem.config.cjs .env prisma prisma.config.js 2>/dev/null || true
+              
+              # This keeps your server disk from getting full! 
+              # It deletes older backups, keeping only the 5 most recent ones.
+              ls -t backups/backup_*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm
+            fi
+            
+            # Extract the newly uploaded code over the existing files.
+            # '--overwrite' replaces old files with the new ones from the zip.
+            tar --overwrite -xzf /tmp/backend-deploy.tar.gz -C /var/www/notes-app/backend
+            
+            # Install ONLY production dependencies on the server (skips devDependencies like typescript or jest).
+            # This makes the install faster and saves server memory.
+            npm ci --omit=dev
+            
+            # If Prisma is used, we must re-generate the Prisma client so it matches the environment.
+            if [ -d "prisma" ]; then
+              npx prisma generate
+            fi
+            
+            # PM2 RESTART LOGIC: PM2 keeps your Node app running forever in the background.
+            if [ -f ecosystem.config.cjs ]; then
+              # If PM2 is already running this app, just reload it (zero-downtime deployment).
+              if pm2 describe ecosystem.config.cjs > /dev/null 2>&1; then
+                pm2 reload ecosystem.config.cjs --update-env
+              else
+                # If it's not running yet, start it up.
+                pm2 start ecosystem.config.cjs
+              fi
+            else
+              # Fallback if you don't use ecosystem.config.cjs (looks for 'notes-backend').
+              if pm2 describe notes-backend > /dev/null 2>&1; then
+                pm2 reload notes-backend
+              else
+                pm2 start src/server.js --name notes-backend
+              fi
+            fi
+            
+            # Save the PM2 list so it restarts automatically if your EC2 instance reboots.
+            pm2 save
+            
+            # Clean up the temporary upload.
+            rm /tmp/backend-deploy.tar.gz
+          EOF
+
+      # Step 5: Verify deployment to ensure it is actually running
+      - name: Verify deployment
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          echo "Waiting for backend to start..."
+          sleep 10
+
+          # Check if app responds to the health check endpoint
+          for i in {1..2}; do
+            echo "Attempt $i of 2..."
+            response=$(curl -s -o /dev/null -w "%{http_code}" http://${EC2_HOST}/health 2>/dev/null || echo "000")
+            
+            if [ "$response" = "200" ] || [ "$response" = "301" ] || [ "$response" = "302" ]; then
+              echo "✅ Deployment successful! App is responding with status: $response"
+              exit 0
+            fi
+            
+            echo "Got response: $response, waiting 5 seconds..."
+            sleep 5
+          done
+
+          echo "❌ Deployment verification failed after 2 attempts"
+          echo "Please check PM2 logs on the server"
+          exit 1
+
+      # Step 6: Always clean up the private key, even if the deployment fails!
+      - name: Cleanup SSH Key
+        if: always()
+        run: rm -f private_key.pem
