@@ -8,6 +8,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Health check endpoint for CI/CD pipeline verification
+app.get('/health', (req, res) => res.status(200).send('OK'));
+
 app.use('/api/notes', noteRoutes);
 
 app.use(errorHandler);
