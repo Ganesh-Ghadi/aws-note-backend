@@ -1,4 +1,5 @@
 import * as noteService from '../services/note.service.js';
+import { uploadFileToS3 } from '../services/aws.service.js';
 
 export const getNotes = async (req, res, next) => {
   try {
@@ -24,7 +25,12 @@ export const getNote = async (req, res, next) => {
 
 export const createNote = async (req, res, next) => {
   try {
-    const newNote = await noteService.createNote(req.body);
+    const data = { ...req.body };
+    if (req.file) {
+      const key = await uploadFileToS3(req.file.buffer, req.file.originalname, req.file.mimetype);
+      data.attachmentPath = key;
+    }
+    const newNote = await noteService.createNote(data);
     res.status(201).json(newNote);
   } catch (error) {
     next(error);
@@ -34,7 +40,12 @@ export const createNote = async (req, res, next) => {
 export const updateNote = async (req, res, next) => {
   try {
     const noteId = parseInt(req.params.id, 10);
-    const updatedNote = await noteService.updateNote(noteId, req.body);
+    const data = { ...req.body };
+    if (req.file) {
+      const key = await uploadFileToS3(req.file.buffer, req.file.originalname, req.file.mimetype);
+      data.attachmentPath = key;
+    }
+    const updatedNote = await noteService.updateNote(noteId, data);
     res.json(updatedNote);
   } catch (error) {
     next(error);
